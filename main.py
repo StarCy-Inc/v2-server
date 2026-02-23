@@ -2,6 +2,8 @@
 StarCy Backend Server - Real-Time Dynamic Island Updates
 Monitors Google Calendar and Gmail changes in real-time
 Sends push notifications to update Dynamic Island even when app is terminated
+
+SECURITY: All endpoints require authentication via JWT tokens
 """
 
 import os
@@ -11,8 +13,9 @@ import jwt
 import httpx
 import asyncio
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request, Header
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -21,6 +24,24 @@ import json
 
 # Load environment variables first
 load_dotenv()
+
+# Import authentication middleware
+from auth_middleware import (
+    get_current_user,
+    rate_limited_user,
+    create_access_token,
+    User,
+    validate_device_token
+)
+
+# Import webhook handler
+try:
+    from webhook_handler import handle_calendar_webhook, setup_google_calendar_webhook
+    WEBHOOKS_AVAILABLE = True
+    print("✅ Webhook handler imported successfully")
+except ImportError as e:
+    print(f"⚠️ Webhook handler import failed: {e}")
+    WEBHOOKS_AVAILABLE = False
 
 # Import google_service after environment is loaded
 try:
@@ -32,7 +53,14 @@ except ImportError as e:
     GOOGLE_AVAILABLE = False
     google_service = None
 
-app = FastAPI(title="StarCy Backend - Real-Time Updates", version="3.0.0")
+app = FastAPI(title="StarCy Backend - Real-Time Updates", version="5.0.0")
+
+# Validate critical environment variables on startup
+REQUIRED_ENV_VARS = ["APNS_KEY_ID", "APNS_TEAM_ID", "APNS_BUNDLE_ID", "JWT_SECRET"]
+missing_vars = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
+if missing_vars:
+    print(f"❌ CRITICAL: Missing environment variables: {', '.join(missing_vars)}")
+    print("⚠️ Server will start but authentication and push notifications will fail")
 
 # APNs Configuration
 APNS_KEY_ID = os.getenv("APNS_KEY_ID")
@@ -65,10 +93,48 @@ google_data_cache: Dict[str, Any] = {
 }
 
 
+DEVICE_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "device_state.json")
+
+
+def save_devices_to_disk():
+    """Persist active_devices to disk so state survives server restarts"""
+    try:
+        serializable = {}
+        for token, info in active_devices.items():
+            entry = {}
+            for k, v in info.items():
+                if isinstance(v, datetime):
+                    entry[k] = v.isoformat()
+                else:
+                    entry[k] = v
+            serializable[token] = entry
+        with open(DEVICE_STATE_FILE, "w") as f:
+            json.dump(serializable, f, default=str)
+        print(f"💾 Saved {len(serializable)} devices to disk")
+    except Exception as e:
+        print(f"❌ Error saving devices to disk: {e}")
+
+
+def load_devices_from_disk():
+    """Restore active_devices from disk on startup"""
+    global active_devices
+    try:
+        if os.path.exists(DEVICE_STATE_FILE):
+            with open(DEVICE_STATE_FILE, "r") as f:
+                loaded = json.load(f)
+            active_devices.update(loaded)
+            print(f"💾 Loaded {len(loaded)} devices from disk")
+        else:
+            print("💾 No saved device state found — starting fresh")
+    except Exception as e:
+        print(f"❌ Error loading devices from disk: {e}")
+
+
 class DeviceRegistration(BaseModel):
     device_token: str
     activity_id: str
     user_id: Optional[str] = None
+    live_activity_push_token: Optional[str] = None  # Live Activity push token (different from device token)
     google_credentials: Optional[Dict[str, Any]] = None  # Store user's Google credentials
     zoho_credentials: Optional[Dict[str, Any]] = None    # Store user's Zoho credentials
 
@@ -77,6 +143,16 @@ class LiveActivityUpdate(BaseModel):
     device_token: str
     activity_id: str
     content_state: Dict[str, Any]
+
+
+class SyncStateRequest(BaseModel):
+    device_token: str
+    calendar_events: Optional[List[Dict[str, Any]]] = None
+    email_data: Optional[Dict[str, Any]] = None
+    weather_data: Optional[Dict[str, Any]] = None  # {temp, condition, icon, sunrise, sunset, location}
+    timezone: Optional[str] = None  # e.g. "Asia/Kolkata"
+    current_island_type: Optional[str] = None
+    is_subscribed: Optional[bool] = None
 
 
 def generate_data_hash(data: Any) -> str:
@@ -173,9 +249,11 @@ async def update_user_dynamic_island(user_id: str):
         content_state = create_content_state_from_cache(user_cache)
         
         # Update all devices for this user
+        # Use live_activity_push_token if registered — required for APNs Live Activity updates
         for device_token, device_info in user_devices:
+            push_token = device_info.get("live_activity_push_token", device_token)
             success = await send_live_activity_update(
-                device_token=device_token,
+                device_token=push_token,
                 activity_id=device_info["activity_id"],
                 content_state=content_state
             )
@@ -327,13 +405,22 @@ async def send_live_activity_update(
         }
         
         url = f"{APNS_URL}/3/device/{device_token}"
-        
-        async with httpx.AsyncClient() as client:
+
+        async with httpx.AsyncClient(http2=True) as client:
             response = await client.post(url, json=payload, headers=headers, timeout=10.0)
-            
+
             if response.status_code == 200:
                 print(f"✅ Live Activity updated for device {device_token[:8]}...")
                 return True
+            elif response.status_code == 410:
+                # Token is no longer valid — remove stale device
+                print(f"⚠️ APNs 410: Token expired for {device_token[:8]}... — removing device")
+                stale_keys = [k for k, v in active_devices.items()
+                              if v.get("live_activity_push_token") == device_token or k == device_token]
+                for k in stale_keys:
+                    active_devices.pop(k, None)
+                save_devices_to_disk()
+                return False
             else:
                 print(f"❌ Failed to update Live Activity: {response.status_code} - {response.text}")
                 return False
@@ -385,14 +472,14 @@ def periodic_google_refresh_job():
         try:
             # Create content state with fresh Google data
             content_state = create_dashboard_content_state()
-            
-            # Send update to device
-            import asyncio
+
+            # Use live_activity_push_token if available — required for APNs Live Activity updates
+            push_token = device_info.get("live_activity_push_token", device_token)
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             success = loop.run_until_complete(
                 send_live_activity_update(
-                    device_token=device_token,
+                    device_token=push_token,
                     activity_id=device_info["activity_id"],
                     content_state=content_state
                 )
@@ -407,47 +494,6 @@ def periodic_google_refresh_job():
                 
         except Exception as e:
             print(f"❌ Error updating device {device_token[:8]}...: {e}")
-
-
-def keep_alive_job():
-    """Job that runs every 30 minutes to keep Live Activities alive"""
-    print("💓 Keep-alive job running...")
-    
-    for device_token, device_info in active_devices.items():
-        try:
-            # Send a minimal update to keep the Live Activity alive
-            content_state = {
-                "callStatus": "Ready",
-                "duration": 0,
-                "transcript": "",
-                "isSpeaking": False,
-                "companionMode": "idle",
-                "currentDate": datetime.now().strftime("%a, %b %d"),
-                "weatherTemp": "24°",  # Placeholder
-                "weatherCondition": "Clear",
-                "weatherIcon": "sun.max.fill"
-            }
-            
-            import asyncio
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            success = loop.run_until_complete(
-                send_live_activity_update(
-                    device_token=device_token,
-                    activity_id=device_info["activity_id"],
-                    content_state=content_state
-                )
-            )
-            loop.close()
-            
-            if success:
-                device_info["last_keepalive"] = datetime.now()
-                print(f"💓 Keep-alive sent to device {device_token[:8]}...")
-            else:
-                print(f"❌ Keep-alive failed for device {device_token[:8]}...")
-                
-        except Exception as e:
-            print(f"❌ Error in keep-alive for device {device_token[:8]}...: {e}")
 
 
 def create_dashboard_content_state() -> Dict[str, Any]:
@@ -485,8 +531,6 @@ def create_dashboard_content_state() -> Dict[str, Any]:
         })
     
     return content_state
-    """Job that runs every 5 minutes to refresh Google data"""
-    refresh_google_data()
 
 
 def calculate_island_score(island_type: str, context: Dict[str, Any], device_info: Dict[str, Any]) -> tuple[float, str]:
@@ -629,7 +673,13 @@ def rotate_content_for_device(device_token: str, device_info: Dict[str, Any]):
     Intelligent Dynamic Island rotation - FULL scoring system matching iOS IslandIntelligenceEngine
     Uses scoring algorithm to select best island based on context
     """
-    now = datetime.now()
+    # Use device timezone if synced, otherwise fall back to server time
+    tz_name = device_info.get("timezone")
+    try:
+        tz = ZoneInfo(tz_name) if tz_name else None
+    except Exception:
+        tz = None
+    now = datetime.now(tz) if tz else datetime.now()
     current_hour = now.hour
     
     # Get user data
@@ -723,7 +773,19 @@ def rotate_content_for_device(device_token: str, device_info: Dict[str, Any]):
         "currentDate": now.strftime("%a, %b %d"),
         "intelligentIslandType": island_type
     }
-    
+
+    # Inject real weather data from synced device state
+    weather = device_info.get("weather_data")
+    if weather:
+        content_state.update({
+            "weatherTemp": weather.get("temp"),
+            "weatherCondition": weather.get("condition"),
+            "weatherIcon": weather.get("icon"),
+            "sunriseTime": weather.get("sunrise"),
+            "sunsetTime": weather.get("sunset"),
+            "locationName": weather.get("location"),
+        })
+
     # Populate content based on island type
     if island_type == "meeting_prep":
         if calendar_events:
@@ -794,19 +856,24 @@ def rotate_content_for_device(device_token: str, device_info: Dict[str, Any]):
                     "topEmailTime": top_email.get("time")
                 })
     
-    # Send update
-    import asyncio
-    asyncio.create_task(
-        send_live_activity_update(
-            device_token,
-            device_info["activity_id"],
-            content_state
+    # Send update (called from a sync thread, so create a new event loop)
+    push_token = device_info.get("live_activity_push_token", device_token)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(
+            send_live_activity_update(
+                push_token,
+                device_info["activity_id"],
+                content_state
+            )
         )
-    )
+    finally:
+        loop.close()
 
 
 def periodic_rotation_job():
-    """Job that runs every 20 seconds to rotate content"""
+    """Job that runs every 60 seconds to rotate content (also serves as keep-alive)"""
     print(f"🔄 Running periodic rotation at {datetime.now().strftime('%H:%M:%S')}")
     for device_token, device_info in list(active_devices.items()):
         rotate_content_for_device(device_token, device_info)
@@ -821,7 +888,12 @@ def periodic_google_refresh_job():
 async def startup_event():
     """Start the scheduler when server starts"""
     print("✅ Backend server starting...")
-    
+    print(f"🔐 JWT Secret configured: {'Yes' if os.getenv('JWT_SECRET') else 'No (INSECURE!)'}")
+    print(f"🔔 APNs configured: {'Yes' if APNS_KEY_ID and APNS_TEAM_ID else 'No'}")
+
+    # Restore device state from disk
+    load_devices_from_disk()
+
     # Try to authenticate with Google
     if GOOGLE_AVAILABLE and google_service:
         print("🔐 Authenticating with Google...")
@@ -831,32 +903,40 @@ async def startup_event():
             refresh_google_data()
             # Schedule Google data refresh every 5 minutes
             scheduler.add_job(periodic_google_refresh_job, 'interval', minutes=5)
-            # Schedule keep-alive job every 30 minutes
-            scheduler.add_job(keep_alive_job, 'interval', minutes=30)
-            print("✅ Google data will refresh every 5 minutes, keep-alive every 30 minutes")
+            print("✅ Google data will refresh every 5 minutes")
         else:
             print("⚠️ Google authentication failed - will use data from iOS app only")
     else:
         print("⚠️ Google service not available - will use data from iOS app only")
-    
-    # Rotate content every 20 seconds (fallback)
-    scheduler.add_job(periodic_rotation_job, 'interval', seconds=20)
-    
+
+    # Rotate content every 60 seconds (Apple rate-limits Live Activity pushes to ~1/min)
+    scheduler.add_job(periodic_rotation_job, 'interval', seconds=60)
+
     # Real-time monitoring every 2 minutes (PRIMARY)
-    scheduler.add_job(real_time_monitoring_job, 'interval', minutes=2)
-    
+    # real_time_monitoring_job is async; wrap it so BackgroundScheduler (sync) can run it
+    def real_time_monitoring_job_wrapper():
+        asyncio.run(real_time_monitoring_job())
+    scheduler.add_job(real_time_monitoring_job_wrapper, 'interval', minutes=2)
+
+    # Persist device state every 5 minutes
+    scheduler.add_job(save_devices_to_disk, 'interval', minutes=5)
+
     scheduler.start()
     print("✅ Scheduler started:")
     print("   - Real-time monitoring: Every 2 minutes")
-    print("   - Content rotation: Every 20 seconds (fallback)")
-    print("   - Keep-alive: Every 30 minutes")
+    print("   - Content rotation: Every 60 seconds")
+    print("   - Device state persistence: Every 5 minutes")
+    print("")
+    print("🚀 Server ready for connections")
+    print(f"📡 Webhook endpoint: {os.getenv('WEBHOOK_URL', 'Not configured')}")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Stop the scheduler when server shuts down"""
+    save_devices_to_disk()
     scheduler.shutdown()
-    print("🛑 Scheduler stopped")
+    print("🛑 Scheduler stopped, device state saved")
 
 
 @app.get("/")
@@ -864,7 +944,7 @@ async def root():
     """Root endpoint with service info"""
     return {
         "service": "StarCy Backend - Real-Time Dynamic Island Updates",
-        "version": "3.0.0",
+        "version": "5.0.0",
         "status": "running",
         "active_devices": len(active_devices),
         "monitoring_users": len(monitoring_cache.get("users", {})),
@@ -882,24 +962,40 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "version": "3.0.0",
+        "version": "5.0.0",
         "active_devices": len(active_devices),
         "monitoring_users": len(monitoring_cache.get("users", {}))
     }
 
 
 @app.post("/register")
-async def register_device(registration: DeviceRegistration):
-    """Register device for Live Activity updates with user credentials for real-time monitoring"""
+async def register_device(
+    registration: DeviceRegistration,
+    user: User = Depends(rate_limited_user)
+):
+    """
+    Register device for Live Activity updates with user credentials for real-time monitoring
+    
+    SECURITY: Requires JWT authentication
+    RATE LIMIT: 10 requests per minute per user
+    """
     try:
         device_token = registration.device_token
         activity_id = registration.activity_id
-        user_id = registration.user_id or f"user_{device_token[:8]}"
+        user_id = user.user_id  # Use authenticated user ID
+        
+        # Validate device token format (basic check)
+        if len(device_token) < 32:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid device token format"
+            )
         
         # Store device with user credentials for real-time monitoring
         active_devices[device_token] = {
             "activity_id": activity_id,
             "user_id": user_id,
+            "live_activity_push_token": registration.live_activity_push_token,  # For APNs Live Activity updates
             "google_credentials": registration.google_credentials,
             "zoho_credentials": registration.zoho_credentials,
             "registered_at": datetime.now(),
@@ -908,9 +1004,11 @@ async def register_device(registration: DeviceRegistration):
             "content_index": 0
         }
         
+        save_devices_to_disk()
+
         print(f"✅ Device registered: {device_token[:8]}... for user {user_id}")
         print(f"🔍 Real-time monitoring: {'Enabled' if registration.google_credentials else 'Disabled'}")
-        
+
         # Send immediate update with current data if credentials provided
         if registration.google_credentials and GOOGLE_AVAILABLE and google_service:
             try:
@@ -970,19 +1068,56 @@ async def register_device(registration: DeviceRegistration):
 
 
 @app.post("/unregister")
-async def unregister_device(device_token: str):
-    """Unregister a device"""
+async def unregister_device(
+    device_token: str,
+    user: User = Depends(rate_limited_user)
+):
+    """
+    Unregister a device
+    
+    SECURITY: Requires JWT authentication
+    RATE LIMIT: 10 requests per minute per user
+    """
     if device_token in active_devices:
+        device_info = active_devices[device_token]
+        
+        # Verify device belongs to user
+        if device_info["user_id"] != user.user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You don't have permission to unregister this device"
+            )
+        
         del active_devices[device_token]
-        print(f"📱 Device unregistered: {device_token[:8]}...")
+        save_devices_to_disk()
+        print(f"📱 Device unregistered: {device_token[:8]}... by user {user.user_id}")
         return {"success": True, "message": "Device unregistered"}
     
     return {"success": False, "message": "Device not found"}
 
 
 @app.post("/update")
-async def update_live_activity(update: LiveActivityUpdate):
-    """Manually trigger a Live Activity update"""
+async def update_live_activity(
+    update: LiveActivityUpdate,
+    user: User = Depends(rate_limited_user)
+):
+    """
+    Manually trigger a Live Activity update
+    
+    SECURITY: Requires JWT authentication
+    RATE LIMIT: 10 requests per minute per user
+    """
+    # Verify device belongs to user
+    if update.device_token not in active_devices:
+        raise HTTPException(status_code=404, detail="Device not registered")
+    
+    device_info = active_devices[update.device_token]
+    if device_info["user_id"] != user.user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You don't have permission to update this device"
+        )
+    
     success = await send_live_activity_update(
         update.device_token,
         update.activity_id,
@@ -996,12 +1131,29 @@ async def update_live_activity(update: LiveActivityUpdate):
 
 
 @app.post("/update_user_data")
-async def update_user_data(device_token: str, calendar_events: Optional[List[Dict]] = None, email_data: Optional[Dict] = None):
-    """Receive calendar and email data from iOS app"""
+async def update_user_data(
+    device_token: str,
+    calendar_events: Optional[List[Dict]] = None,
+    email_data: Optional[Dict] = None,
+    user: User = Depends(rate_limited_user)
+):
+    """
+    Receive calendar and email data from iOS app
+    
+    SECURITY: Requires JWT authentication
+    RATE LIMIT: 10 requests per minute per user
+    """
     if device_token not in active_devices:
         raise HTTPException(status_code=404, detail="Device not registered")
     
     device_info = active_devices[device_token]
+    
+    # Verify device belongs to user
+    if device_info["user_id"] != user.user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You don't have permission to update this device"
+        )
     
     # Store calendar events
     if calendar_events:
@@ -1016,6 +1168,43 @@ async def update_user_data(device_token: str, calendar_events: Optional[List[Dic
     device_info["last_data_update"] = datetime.now().isoformat()
     
     return {"success": True, "message": "User data updated"}
+
+
+@app.post("/sync_state")
+async def sync_state(req: SyncStateRequest):
+    """
+    Receive full app state from iOS before backgrounding.
+    No auth required — the iOS app calls this with its device token as identifier.
+    This keeps the backend in sync so it can push accurate updates when the app is killed.
+    """
+    token = req.device_token
+    if token not in active_devices:
+        raise HTTPException(status_code=404, detail="Device not registered — call /register first")
+
+    device_info = active_devices[token]
+
+    if req.calendar_events is not None:
+        device_info["calendar_events"] = req.calendar_events
+    if req.email_data is not None:
+        device_info["email_data"] = req.email_data
+    if req.weather_data is not None:
+        device_info["weather_data"] = req.weather_data
+    if req.timezone is not None:
+        device_info["timezone"] = req.timezone
+    if req.current_island_type is not None:
+        device_info["current_island_type"] = req.current_island_type
+    if req.is_subscribed is not None:
+        device_info["is_subscribed"] = req.is_subscribed
+
+    device_info["last_sync"] = datetime.now().isoformat()
+    save_devices_to_disk()
+
+    print(f"🔄 Full state synced for device {token[:8]}... "
+          f"(tz={req.timezone}, island={req.current_island_type}, "
+          f"events={len(req.calendar_events) if req.calendar_events else 0}, "
+          f"weather={'yes' if req.weather_data else 'no'})")
+
+    return {"success": True, "message": "State synced"}
 
 
 @app.get("/devices")
@@ -1127,6 +1316,41 @@ async def create_calendar_event(request: CalendarEventRequest) -> CalendarEventR
         success=True,
         message=f"Calendar event '{request.title}' validated and ready for creation.",
         event_id="pending_ios_integration"
+    )
+
+
+@app.post("/webhooks/google/calendar")
+async def google_calendar_webhook(
+    request: Request,
+    x_goog_channel_id: str = Header(None),
+    x_goog_resource_state: str = Header(None),
+    x_goog_resource_id: str = Header(None)
+):
+    """
+    Handle Google Calendar push notifications for instant updates
+    
+    This endpoint receives notifications when a user's calendar changes,
+    allowing for real-time Dynamic Island updates without polling.
+    
+    Headers:
+        x-goog-channel-id: Channel ID from Google
+        x-goog-resource-state: Resource state (sync, exists, not_exists)
+        x-goog-resource-id: Resource ID
+    
+    Returns:
+        Success response
+    """
+    if not WEBHOOKS_AVAILABLE:
+        raise HTTPException(
+            status_code=501,
+            detail="Webhooks not configured"
+        )
+    
+    return await handle_calendar_webhook(
+        request,
+        x_goog_channel_id,
+        x_goog_resource_state,
+        x_goog_resource_id
     )
 
 

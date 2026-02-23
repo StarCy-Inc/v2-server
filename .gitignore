@@ -1,9 +1,25 @@
+# Python
 venv/
 __pycache__/
 *.pyc
+*.pyo
+*.log
+
+# Environment variables
 .env
+.env.*
+
+# Secrets - NEVER commit
 token.json
 credentials.json
 *.p8
+*.p12
+*.pem
+*.key
+
+# OS
 .DS_Store
-*.log
+
+# Database (when we add it)
+*.db
+*.sqlite
